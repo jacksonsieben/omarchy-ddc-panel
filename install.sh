@@ -94,10 +94,14 @@ jq \
 mv "$PLUGINS_DIR/$MONITOR_ID/manifest.json.tmp" "$PLUGINS_DIR/$MONITOR_ID/manifest.json"
 
 say "Patching the cloned Panel.qml"
-PLUGIN_ID="$PLUGIN_ID" \
-MARKER_BEGIN="$MARKER_BEGIN" \
-MARKER_END="$MARKER_END" \
-python3 - "$PLUGINS_DIR/$MONITOR_ID/Panel.qml" <<'PYTHON'
+# Via `env` rather than an assignment prefix: these names are readonly in this
+# shell, and bash rejects a prefix assignment to a readonly variable even when
+# it only ever applies to the child process.
+env \
+  PLUGIN_ID="$PLUGIN_ID" \
+  MARKER_BEGIN="$MARKER_BEGIN" \
+  MARKER_END="$MARKER_END" \
+  python3 - "$PLUGINS_DIR/$MONITOR_ID/Panel.qml" <<'PYTHON'
 import os
 import re
 import sys
@@ -177,12 +181,23 @@ PYTHON
 # enabled by being in the layout; services need this explicit entry.
 
 if [[ -f $SHELL_CONFIG ]]; then
-  if jq -e --arg id "$PLUGIN_ID" '(.plugins // []) | index($id)' "$SHELL_CONFIG" >/dev/null; then
+  # Entries are objects, not bare strings: the registry reads
+  # `config.plugins[j].id` (PluginRegistry.findEntryLocation), so a plain
+  # "sieben.ddc" is discovered but never counts as enabled -- the service then
+  # silently never mounts, with nothing in the log to say why.
+  if jq -e --arg id "$PLUGIN_ID" '
+       any((.plugins // [])[]; type == "object" and .id == $id)
+     ' "$SHELL_CONFIG" >/dev/null; then
     say "$PLUGIN_ID already enabled in shell.json"
   else
     say "Enabling $PLUGIN_ID in shell.json"
     tmp="$(mktemp "$SHELL_CONFIG.XXXXXX")"
-    jq --arg id "$PLUGIN_ID" '.plugins = ((.plugins // []) + [$id] | unique)' "$SHELL_CONFIG" >"$tmp"
+    jq --arg id "$PLUGIN_ID" '
+      .plugins = (
+        [ (.plugins // [])[] | select((if type == "object" then .id else . end) != $id) ]
+        + [ { id: $id } ]
+      )
+    ' "$SHELL_CONFIG" >"$tmp"
     chmod --reference="$SHELL_CONFIG" "$tmp"
     mv "$tmp" "$SHELL_CONFIG"
   fi

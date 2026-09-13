@@ -220,11 +220,15 @@ Column {
           onClicked: root.ddc.toggleBlank(block.display.connector)
         }
 
+        // Said plainly, because the alternative is a button that looks broken.
+        // Hyprland's misc:key_press_enables_dpms and misc:mouse_move_enables_dpms
+        // are on by default, and they wake every blanked monitor, not just the
+        // one the input was meant for.
         Text {
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          text: "Powers the panel down over DDC/CI. Takes a moment to come back, and some monitors re-scan inputs on wake."
+          text: "Turns this panel off. Your next keypress or mouse movement brings it straight back, so this is for stepping away rather than for keeping one screen dark while you work on another."
           color: Qt.darker(root.bar.foreground, 1.5)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption

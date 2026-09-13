@@ -19,7 +19,7 @@ is already a DDC slider. What was missing is everything else.
 |---|---|
 | **Input switching** (VCP `60`) | new |
 | **Contrast** (VCP `12`) | new |
-| **Per-monitor OLED blanking** (VCP `D6`) | new |
+| **Per-monitor blanking** (DPMS, optional `D6` standby) | new |
 | Brightness (VCP `10`) | already in Omarchy — untouched |
 | Idle blanking without locking | already handled by [Screen Off Only](#relationship-to-screen-off-only) |
 
@@ -61,7 +61,8 @@ omarchy-ddc list                      # JSON for every DDC display
 omarchy-ddc input HDMI-A-1            # read the current input
 omarchy-ddc input HDMI-A-1 0x0f       # switch to DisplayPort-1
 omarchy-ddc contrast HDMI-A-1 75
-omarchy-ddc blank HDMI-A-1            # DDC standby, this monitor only
+omarchy-ddc blank HDMI-A-1            # DPMS off, this monitor only
+omarchy-ddc blank HDMI-A-1 --standby  # and power it down over DDC, if supported
 omarchy-ddc wake HDMI-A-1
 omarchy-ddc refresh                   # drop the detection cache
 ```
@@ -107,31 +108,68 @@ producing a broken panel, and the anchor in `install.sh` needs updating.
 
 ### Blanking one monitor
 
-Each OLED block gets a **Blank this display** button, which powers that panel
-down over DDC/CI (`VCP D6` → `0x04`).
+Each OLED block gets a **Blank this display** button, which drives Hyprland's
+per-monitor DPMS.
 
-Blanking goes over DDC rather than Hyprland's DPMS on purpose. Hyprland's
-`dpms` dispatcher takes an optional monitor selector, and when that selector
-fails to resolve it silently falls back to **every** monitor:
+DDC standby (`VCP D6`) is the obvious candidate, and it is what the GNOME port
+offers — but it is not trustworthy. The ASUS XG27AQDMGR this was developed
+against accepts the write and quietly ignores it:
+
+```
+$ ddcutil --bus 3 setvcp D6 4
+Verification failed for feature d6
+    Try errors: DDCRC_VERIFY
+```
+
+With `--noverify`, which you want everywhere else for speed, that looks like
+success. A blank button that silently does nothing is worse than no button.
+DPMS works on every monitor, including the laptop eDP panel that speaks no DDC
+at all, comes back instantly, and does not make the monitor re-scan its inputs
+the way a standby cycle does.
+
+`omarchy-ddc list` reports `"supportsStandby"` per monitor — determined by one
+deliberately *verified* `D6` write, cached, since the answer never changes for a
+given panel. Where it is `true`, `blank --standby` also powers the panel down
+for the real power saving. `0x04` ("DPM off") is used rather than `0x05`
+("power off"): `0x05` is a coin flip on real hardware, and plenty of panels will
+not answer DDC again until you press their physical power button.
+
+#### The one hazard worth knowing about
+
+Hyprland's `dpms` dispatcher takes an **optional** monitor selector, and a
+selector that fails to resolve leaves it `std::nullopt` — which means *every*
+monitor:
 
 ```c
 // src/config/lua/bindings/LuaBindingsDispatchers.cpp
 std::optional<PHLMONITOR> mon = std::nullopt;
 if (!lua_isnil(L, lua_upvalueindex(2))) {
     auto m = State::monitorState()->query()...run();
-    if (m) mon = m;          // no else — a miss leaves nullopt
+    if (m) mon = m;          // no else — a miss silently means "all"
 }
-return Internal::checkResult(L, CA::dpms(action, mon));
 ```
 
-For a feature whose entire job is "darken *this* screen", blacking out the
-whole session on a selector miss is not an acceptable failure mode. `VCP D6`
-addresses a single i2c bus by construction, so it cannot spill.
+So `omarchy-ddc` never dispatches a name without first confirming Hyprland has
+a monitor by that name:
 
-The trade-off is real: DDC standby takes a second or two to come back, and some
-monitors re-scan their inputs on wake. `0x04` ("DPM off") is used rather than
-`0x05` ("power off") because `0x05` is a coin flip on real hardware — plenty of
-panels will not answer DDC again until you press their physical power button.
+```
+$ omarchy-ddc blank NOPE-1
+omarchy-ddc: hyprland has no monitor named NOPE-1; refusing to dispatch
+```
+
+#### Blanking does not survive your next keypress
+
+`misc:key_press_enables_dpms` and `misc:mouse_move_enables_dpms` are on by
+default in Hyprland, and they wake **every** blanked monitor, not just the one
+the input was aimed at. So a manual blank lasts until you next touch the
+keyboard or mouse.
+
+That makes the button useful for stepping away, and not useful for keeping one
+screen dark while you keep working on another — which is the case the GNOME port
+handles with an input-transparent overlay and a pointer warp. Doing the
+equivalent here means turning those two options off while a partial blank is
+held, and that carries a genuine lockout risk if the remaining lit monitor then
+blanks on idle. It is deliberately not done.
 
 ### Which monitors count as OLED
 

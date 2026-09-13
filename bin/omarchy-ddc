@@ -274,18 +274,88 @@ resolve_inputs() {
 
 # --------------------------------------------------------------------- blank
 #
-# Per-monitor blanking goes over DDC (VCP D6), never Hyprland DPMS.
+# Blanking drives Hyprland's per-monitor DPMS, not DDC standby.
 #
-# Hyprland's dpms dispatcher takes an optional monitor selector, and when that
-# selector fails to resolve it falls back to *every* monitor rather than
-# erroring. For a feature whose whole job is "darken this one screen", the
-# failure mode of "blacked out the entire session" is not acceptable. VCP D6
-# addresses one i2c bus by construction, so it cannot spill.
+# DDC standby (VCP D6) is the obvious candidate and it is what the GNOME port
+# offers, but plenty of monitors -- including the ASUS XG27AQDMGR this was
+# developed against -- accept the write and quietly ignore it. `ddcutil setvcp`
+# without --noverify reports that as DDCRC_VERIFY; with --noverify, which is
+# what you want everywhere else for speed, it looks like success. A blank
+# button that silently does nothing is worse than no button.
 #
-# The trade-off is real and worth stating: DDC standby takes a second or two to
-# come back, and some monitors re-scan their inputs on wake.
-blank_bus() { set_vcp "$1" "$VCP_POWER" "$POWER_OFF"; }
-wake_bus()  { set_vcp "$1" "$VCP_POWER" "$POWER_ON"; }
+# DPMS works on every monitor, including the laptop eDP panel that speaks no
+# DDC at all, comes back instantly, and does not make the monitor re-scan its
+# inputs the way a standby cycle does.
+#
+# The one hazard: Hyprland's dpms dispatcher takes an *optional* monitor
+# selector, and a selector that fails to resolve leaves it std::nullopt, which
+# means every monitor:
+#
+#   if (m) mon = m;            // no else -- a miss silently means "all"
+#
+# So never hand it a name without checking that Hyprland actually has that
+# monitor first. Getting this wrong blacks out the whole session.
+connector_exists() {
+  local connector="$1"
+  [[ -n $connector ]] || return 1
+  hyprctl monitors all -j 2>/dev/null \
+    | jq -e --arg name "$connector" 'any(.[]; .name == $name)' >/dev/null
+}
+
+dpms() {
+  local action="$1" connector="$2"
+
+  connector_exists "$connector" || {
+    printf 'omarchy-ddc: hyprland has no monitor named %s; refusing to dispatch\n' \
+      "$connector" >&2
+    return 1
+  }
+
+  hyprctl dispatch \
+    "hl.dsp.dpms({ action = \"$action\", monitor = \"$connector\" })" >/dev/null 2>&1
+}
+
+blank_connector() { dpms disable "$1"; }
+wake_connector()  { dpms enable "$1"; }
+
+# Optional extra: actually power the panel down over DDC, for the monitors that
+# honour it. Verified deliberately (no --noverify) so an unsupported monitor
+# reports failure instead of pretending.
+standby_bus() {
+  ddcutil --bus "$1" --skip-ddc-checks setvcp "$VCP_POWER" "$POWER_OFF" >/dev/null 2>&1
+}
+
+resume_bus() {
+  ddcutil --bus "$1" --skip-ddc-checks --noverify setvcp "$VCP_POWER" "$POWER_ON" >/dev/null 2>&1
+}
+
+# Whether this monitor honours a D6 write at all. Cached, because finding out
+# costs a failed verified write and the answer never changes for a given panel.
+supports_standby() {
+  local bus="$1" cache="$CACHE_DIR/standby-$bus"
+
+  if [[ -r $cache ]]; then
+    [[ $(<"$cache") == yes ]]
+    return
+  fi
+
+  local answer=no
+  if standby_bus "$bus"; then
+    answer=yes
+    resume_bus "$bus"
+  fi
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$answer" >"$cache" 2>/dev/null || true
+  [[ $answer == yes ]]
+}
+
+connector_blanked() {
+  # Not `.dpmsStatus // false`: jq's alternative operator treats `false` itself
+  # as absent, so that spelling reports a blanked monitor as lit.
+  hyprctl monitors all -j 2>/dev/null \
+    | jq -e --arg name "$1" 'any(.[]; .name == $name and .dpmsStatus == false)' >/dev/null
+}
 
 # -------------------------------------------------------------------- commands
 
@@ -299,12 +369,15 @@ cmd_list() {
   while IFS=$'\t' read -r bus connector mfg model serial; do
     [[ -n $bus ]] || continue
 
-    local brightness contrast input power oled inputs_json
+    local brightness contrast input oled blanked standby inputs_json
     brightness="$(get_percent "$bus" "$VCP_BRIGHTNESS")" || brightness=""
     contrast="$(get_percent "$bus" "$VCP_CONTRAST")" || contrast=""
     input="$(get_vcp "$bus" "$VCP_INPUT")" || input=""
-    power="$(get_vcp "$bus" "$VCP_POWER")" || power=""
     is_oled "$mfg" "$model" && oled=true || oled=false
+    # Blanked is a compositor fact, not a monitor one: DPMS is what blanking
+    # drives, and VCP D6 reads "on" on panels that ignore the write anyway.
+    connector_blanked "$connector" && blanked=true || blanked=false
+    supports_standby "$bus" && standby=true || standby=false
 
     inputs_json="$(resolve_inputs "$bus" | jq -R -s -c '
       split("\n") | map(select(length > 0) | split("\t") | {code: .[0], label: .[1]})
@@ -319,8 +392,9 @@ cmd_list() {
       --arg brightness "$brightness" \
       --arg contrast "$contrast" \
       --arg input "$input" \
-      --arg power "$power" \
       --argjson oled "$oled" \
+      --argjson blanked "$blanked" \
+      --argjson standby "$standby" \
       --argjson inputs "$inputs_json" \
       '{
          bus: ($bus | tonumber),
@@ -332,7 +406,8 @@ cmd_list() {
          brightness: (if $brightness == "" then null else ($brightness | tonumber) end),
          contrast:   (if $contrast   == "" then null else ($contrast   | tonumber) end),
          input:      (if $input      == "" then null else ($input | ltrimstr("x") | ascii_downcase) end),
-         blanked:    (if $power      == "" then null else (($power | ltrimstr("x") | ascii_downcase) != "01") end),
+         blanked: $blanked,
+         supportsStandby: $standby,
          inputs: $inputs
        }')")
   done <<<"$rows"
@@ -356,8 +431,9 @@ Usage: omarchy-ddc <command> [target] [value]
   input <target> [code]         read or switch the input source (VCP 60)
   brightness <target> [pct]     read or set brightness (VCP 10)
   contrast <target> [pct]       read or set contrast (VCP 12)
-  blank <target>                DDC standby, this monitor only (VCP D6)
-  wake <target>                 bring it back
+  blank <target> [--standby]    blank one monitor via DPMS; --standby also
+                                powers it down over DDC where supported
+  wake <target> [--standby]     bring it back
   refresh                       drop the detection cache
 
 `target` is a connector name (HDMI-A-1), an i2c bus number, or omitted for
@@ -423,22 +499,43 @@ main() {
     fi
     ;;
   blank | wake)
-    local targets=() bus
-    if [[ ${1:-} == "all" ]]; then
-      mapfile -t targets < <(detect_cached | cut -f1)
+    # Blanking is addressed by connector, not bus: it drives DPMS, which works
+    # on every monitor Hyprland knows about -- including the laptop panel that
+    # has no DDC at all and so never appears in `list`.
+    local target="${1:-}" with_standby=0
+    [[ ${2:-} == "--standby" ]] && with_standby=1
+
+    local connectors=()
+    if [[ $target == "all" ]]; then
+      mapfile -t connectors < <(hyprctl monitors all -j 2>/dev/null | jq -r '.[].name')
     else
-      bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
-      targets=("$bus")
+      [[ -n $target ]] || target="$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select(.focused)][0].name // ""')"
+      [[ -n $target ]] || die "could not work out which monitor to $command"
+      connectors=("$target")
     fi
-    local failed=0
-    for bus in "${targets[@]}"; do
+
+    (( ${#connectors[@]} > 0 )) || die "no monitors to $command"
+
+    local failed=0 connector bus
+    for connector in "${connectors[@]}"; do
       if [[ $command == blank ]]; then
-        blank_bus "$bus" || failed=1
+        blank_connector "$connector" || { failed=1; continue; }
       else
-        wake_bus "$bus" || failed=1
+        wake_connector "$connector" || { failed=1; continue; }
+      fi
+
+      # The DDC half is best-effort and strictly additional: it saves real
+      # power on monitors that honour it, and is skipped entirely on the ones
+      # that do not rather than being reported as a failure.
+      if (( with_standby )) && bus="$(resolve_bus "$connector" 2>/dev/null)"; then
+        if [[ $command == blank ]]; then
+          supports_standby "$bus" && standby_bus "$bus"
+        else
+          resume_bus "$bus"
+        fi
       fi
     done
-    (( failed == 0 )) || die "$command failed on at least one display"
+    (( failed == 0 )) || die "$command failed on at least one monitor"
     ;;
   *)
     usage >&2
