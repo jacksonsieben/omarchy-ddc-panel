@@ -1,0 +1,450 @@
+#!/bin/bash
+
+# omarchy:summary=Query and control DDC/CI monitors (inputs, contrast, standby).
+# omarchy:group=ddc
+# omarchy:args=list|inputs|get|set|input|brightness|contrast|blank|wake|state <target> [value]
+# omarchy:examples=omarchy-ddc list | omarchy-ddc input HDMI-A-1 0x0f | omarchy-ddc blank HDMI-A-1
+#
+# The shell plugin drives everything through this script, so every capability
+# it has is reachable from a terminal too -- which is how you tell a monitor
+# that refuses a command apart from a bug in the panel.
+#
+# `target` is a Hyprland connector name (HDMI-A-1), an i2c bus number (3), or
+# `all`. Connector names are what the rest of Omarchy speaks, so they are the
+# primary form; the bus is what ddcutil actually addresses.
+
+set -uo pipefail
+
+readonly VCP_BRIGHTNESS=10
+readonly VCP_CONTRAST=12
+readonly VCP_INPUT=60
+readonly VCP_POWER=D6
+
+# MCCS power modes. 0x04 ("DPM off") is the deepest state monitors reliably
+# come back from over DDC/CI; 0x05 ("power off") is a coin flip on real
+# hardware -- plenty of panels will not answer DDC again until you touch their
+# physical power button. Never default to 5.
+readonly POWER_ON=1
+readonly POWER_OFF=4
+
+readonly CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-ddc"
+readonly DETECT_CACHE="$CACHE_DIR/detect.tsv"
+readonly DETECT_TTL=300
+
+# Standard MCCS Input Source (VCP 0x60) values, used when a monitor's
+# capability string cannot be read -- which is the common case, not the
+# exceptional one: `ddcutil capabilities` fails on plenty of hardware whose
+# getvcp/setvcp work perfectly.
+standard_inputs() {
+  cat <<'EOF'
+01	VGA-1
+02	VGA-2
+03	DVI-1
+04	DVI-2
+0f	DisplayPort-1
+10	DisplayPort-2
+11	HDMI-1
+12	HDMI-2
+EOF
+}
+
+die() {
+  printf 'omarchy-ddc: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"
+}
+
+# ------------------------------------------------------------------ detection
+
+# Emits: bus \t connector \t manufacturer \t model \t serial
+# Only "Display N" blocks are real DDC/CI displays; ddcutil also reports
+# "Invalid display" blocks for laptop eDP panels, which have an i2c bus but no
+# usable DDC. Those must not appear here or the panel offers controls that
+# silently do nothing.
+detect_raw() {
+  ddcutil detect --brief 2>/dev/null | awk '
+    /^[^[:space:]]/ {
+      flush()
+      valid = ($0 ~ /^Display[[:space:]]+[0-9]+/)
+      bus = connector = monitor = ""
+      next
+    }
+    /I2C bus:/        { bus = $NF; sub(/^.*\/i2c-/, "", bus) }
+    /DRM connector:/  { connector = $NF; sub(/^card[0-9]+-/, "", connector) }
+    /Monitor:/        { sub(/^[[:space:]]*Monitor:[[:space:]]*/, ""); monitor = $0 }
+    END { flush() }
+
+    function flush(   parts, n) {
+      if (!valid || bus == "" || connector == "") return
+      n = split(monitor, parts, ":")
+      printf "%s\t%s\t%s\t%s\t%s\n", bus, connector, parts[1], parts[2], (n >= 3 ? parts[3] : "")
+      valid = 0
+    }
+  '
+}
+
+# `ddcutil detect` costs a couple of seconds and hits every i2c bus, so the
+# panel must not run it on every open. Cache it, and let any command that
+# actually fails against a stale bus invalidate the cache itself.
+detect_cached() {
+  local now cached_at
+  now=$(date +%s)
+
+  if [[ -s $DETECT_CACHE ]]; then
+    cached_at=$(stat -c %Y "$DETECT_CACHE" 2>/dev/null || echo 0)
+    if (( now - cached_at < DETECT_TTL )); then
+      cat "$DETECT_CACHE"
+      return 0
+    fi
+  fi
+
+  local out
+  out="$(detect_raw)"
+  [[ -n $out ]] || return 1
+
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$out" >"$DETECT_CACHE" 2>/dev/null || true
+  printf '%s\n' "$out"
+}
+
+invalidate_cache() {
+  rm -f "$DETECT_CACHE" 2>/dev/null || true
+}
+
+# Resolve a target to a bus number. Accepts a bus, a connector name, or the
+# sole display when there is exactly one.
+resolve_bus() {
+  local target="${1:-}"
+  local rows
+  rows="$(detect_cached)" || return 1
+
+  if [[ $target =~ ^[0-9]+$ ]]; then
+    awk -F'\t' -v b="$target" '$1 == b { print $1; found = 1; exit } END { exit !found }' <<<"$rows"
+    return
+  fi
+
+  if [[ -z $target || $target == "focused" ]]; then
+    target="$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select(.focused)][0].name // ""')"
+  fi
+
+  [[ -n $target ]] || return 1
+  awk -F'\t' -v c="$target" '$2 == c { print $1; found = 1; exit } END { exit !found }' <<<"$rows"
+}
+
+# ----------------------------------------------------------------------- OLED
+#
+# There is no field in EDID that says "this panel is OLED" -- EDID 1.4 has no
+# panel-technology entry, and the DisplayID block that does is absent from
+# essentially every desktop monitor shipping today. So match the model string
+# each monitor advertises against the known OLED-only product families.
+#
+# Deliberately conservative: it would rather miss an OLED than blank an LCD
+# nobody asked it to. The escape hatch is the plugin's manual monitor list.
+is_oled() {
+  local mfg="${1:-}" model="${2:-}"
+
+  # Vendor-agnostic: most OLED monitors, and essentially every OLED TV pressed
+  # into service as one, simply say so. No trailing boundary -- LG runs the two
+  # together, as in "OLED55C1".
+  [[ $model =~ (^|[^A-Za-z])(AM|QD[[:space:]-]?)?OLED ]] && return 0
+
+  case "$mfg" in
+  AUS)
+    # ASUS ROG Swift / ROG Strix / ProArt.
+    [[ $model =~ ^(PG27AQD|PG27UCD|PG32UCD|PG34WCD|PG39WCD|PG49WCD|XG27AQD|XG27ACD|XG32UCD|PA32DC) ]] && return 0
+    [[ $model =~ ^(PG42UQ|PG48UQ) ]] && return 0
+    ;;
+  GSM)
+    # LG UltraGear / UltraFine OLED. The GR95/GS95/GX families and the
+    # EQ85/EP95 UltraFine Pro panels are OLED-only lines.
+    [[ $model =~ ^(27|32|34|39|45|48)G[RS]9[0-9] ]] && return 0
+    [[ $model =~ ^(27|32|34|39|45)GX[789] ]] && return 0
+    [[ $model =~ ^(27EQ85|32EP95|48GQ900) ]] && return 0
+    ;;
+  DEL)
+    # Dell / Alienware, listed individually: the AW27xx line mixes OLED and
+    # IPS models under near-identical names.
+    [[ $model =~ ^(AW3423DW|AW3423DWF|AW3225QF|AW2725DF|AW2725Q|AW2725D3|AW5520QF) ]] && return 0
+    ;;
+  SDC)
+    # Every Samsung Display "ATNA" part is an OLED panel, which makes this the
+    # one genuinely dependable rule in the table.
+    [[ $model =~ ^ATNA ]] && return 0
+    ;;
+  SAM)
+    [[ $model =~ ^(LS27DG60|LS32DG80|LS34BG85|LS34DG85|LS49CG93|LS49CG95|LS57CG95) ]] && return 0
+    [[ $model =~ G[89][05]S[BCD] ]] && return 0
+    ;;
+  GBT)
+    # Gigabyte / AORUS: the FO and MO series are the OLED lines, kept distinct
+    # from the LCD M/G series by that leading O.
+    [[ $model =~ ^(FO|MO)[0-9][0-9] ]] && return 0
+    ;;
+  MSI)
+    [[ $model =~ ^(MPG27[12]|MPG32[12]|MAG27[12]|MAG32[12]|MAG34[12]|MPG49[12]|MEG34[12])[A-Z]*(QR|UR|UP|CQP|C) ]] && return 0
+    ;;
+  esac
+
+  return 1
+}
+
+# ------------------------------------------------------------------------ VCP
+
+ddc() {
+  local bus="$1"
+  shift
+  ddcutil --bus "$bus" --skip-ddc-checks "$@" 2>/dev/null
+}
+
+# Prints "current max" for continuous features, or "xNN" for non-continuous.
+get_vcp() {
+  local bus="$1" feature="$2"
+
+  ddc "$bus" getvcp "$feature" --brief | awk -v f="$feature" '
+    $1 == "VCP" && toupper($2) == toupper(f) {
+      if ($3 == "C" && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/) { print $4, $5; found = 1; exit }
+      if ($3 == "SNC" && $4 ~ /^x[0-9a-fA-F]+$/)           { print $4;     found = 1; exit }
+    }
+    END { exit !found }
+  '
+}
+
+set_vcp() {
+  local bus="$1" feature="$2" value="$3"
+
+  if ddc "$bus" --noverify setvcp "$feature" "$value" >/dev/null; then
+    return 0
+  fi
+
+  # A bus that has gone away (monitor unplugged, or renumbered after a resume)
+  # must not stay cached, or every later call fails the same way.
+  invalidate_cache
+  return 1
+}
+
+# Percentage helpers: VCP 10 and 12 are continuous features whose maximum is
+# monitor-defined (usually 100, but not always), so never assume the range.
+get_percent() {
+  local bus="$1" feature="$2" cur max
+  read -r cur max < <(get_vcp "$bus" "$feature") || return 1
+  [[ ${max:-0} =~ ^[0-9]+$ ]] && (( max > 0 )) || return 1
+  printf '%s\n' $(( (cur * 100 + max / 2) / max ))
+}
+
+set_percent() {
+  local bus="$1" feature="$2" percent="$3" cur max raw
+  read -r cur max < <(get_vcp "$bus" "$feature") || return 1
+  [[ ${max:-0} =~ ^[0-9]+$ ]] && (( max > 0 )) || return 1
+
+  (( percent < 0 )) && percent=0
+  (( percent > 100 )) && percent=100
+  (( raw = (percent * max + 50) / 100 ))
+
+  set_vcp "$bus" "$feature" "$raw" || return 1
+  printf '%s\n' "$percent"
+}
+
+# Resolve the input list for a monitor: its own capability string when it can
+# be read, the standard MCCS list when it cannot.
+resolve_inputs() {
+  local bus="$1" caps
+
+  caps="$(ddc "$bus" capabilities)"
+  if [[ -n $caps ]]; then
+    local parsed
+    parsed="$(awk '
+      /^[[:space:]]*Feature:[[:space:]]*60/ { infeature = 1; next }
+      /^[[:space:]]*Feature:/               { infeature = 0 }
+      infeature && match($0, /([0-9a-fA-F]{2}):[[:space:]]*(.+)$/, m) {
+        gsub(/[[:space:]]+$/, "", m[2])
+        printf "%s\t%s\n", tolower(m[1]), m[2]
+      }
+    ' <<<"$caps")"
+    if [[ -n $parsed ]]; then
+      printf '%s\n' "$parsed"
+      return 0
+    fi
+  fi
+
+  standard_inputs
+}
+
+# --------------------------------------------------------------------- blank
+#
+# Per-monitor blanking goes over DDC (VCP D6), never Hyprland DPMS.
+#
+# Hyprland's dpms dispatcher takes an optional monitor selector, and when that
+# selector fails to resolve it falls back to *every* monitor rather than
+# erroring. For a feature whose whole job is "darken this one screen", the
+# failure mode of "blacked out the entire session" is not acceptable. VCP D6
+# addresses one i2c bus by construction, so it cannot spill.
+#
+# The trade-off is real and worth stating: DDC standby takes a second or two to
+# come back, and some monitors re-scan their inputs on wake.
+blank_bus() { set_vcp "$1" "$VCP_POWER" "$POWER_OFF"; }
+wake_bus()  { set_vcp "$1" "$VCP_POWER" "$POWER_ON"; }
+
+# -------------------------------------------------------------------- commands
+
+cmd_list() {
+  local rows
+  rows="$(detect_cached)" || { printf '[]\n'; return 0; }
+
+  local bus connector mfg model serial
+  local -a entries=()
+
+  while IFS=$'\t' read -r bus connector mfg model serial; do
+    [[ -n $bus ]] || continue
+
+    local brightness contrast input power oled inputs_json
+    brightness="$(get_percent "$bus" "$VCP_BRIGHTNESS")" || brightness=""
+    contrast="$(get_percent "$bus" "$VCP_CONTRAST")" || contrast=""
+    input="$(get_vcp "$bus" "$VCP_INPUT")" || input=""
+    power="$(get_vcp "$bus" "$VCP_POWER")" || power=""
+    is_oled "$mfg" "$model" && oled=true || oled=false
+
+    inputs_json="$(resolve_inputs "$bus" | jq -R -s -c '
+      split("\n") | map(select(length > 0) | split("\t") | {code: .[0], label: .[1]})
+    ')"
+
+    entries+=("$(jq -n -c \
+      --arg bus "$bus" \
+      --arg connector "$connector" \
+      --arg mfg "$mfg" \
+      --arg model "$model" \
+      --arg serial "$serial" \
+      --arg brightness "$brightness" \
+      --arg contrast "$contrast" \
+      --arg input "$input" \
+      --arg power "$power" \
+      --argjson oled "$oled" \
+      --argjson inputs "$inputs_json" \
+      '{
+         bus: ($bus | tonumber),
+         connector: $connector,
+         manufacturer: $mfg,
+         model: $model,
+         serial: $serial,
+         oled: $oled,
+         brightness: (if $brightness == "" then null else ($brightness | tonumber) end),
+         contrast:   (if $contrast   == "" then null else ($contrast   | tonumber) end),
+         input:      (if $input      == "" then null else ($input | ltrimstr("x") | ascii_downcase) end),
+         blanked:    (if $power      == "" then null else (($power | ltrimstr("x") | ascii_downcase) != "01") end),
+         inputs: $inputs
+       }')")
+  done <<<"$rows"
+
+  if (( ${#entries[@]} == 0 )); then
+    printf '[]\n'
+    return 0
+  fi
+
+  printf '%s\n' "${entries[@]}" | jq -s -c '.'
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-ddc <command> [target] [value]
+
+  list                          JSON for every DDC/CI display
+  inputs <target>               resolved input list (code<TAB>label)
+  get <target> <vcp>            read a raw VCP feature
+  set <target> <vcp> <value>    write a raw VCP feature
+  input <target> [code]         read or switch the input source (VCP 60)
+  brightness <target> [pct]     read or set brightness (VCP 10)
+  contrast <target> [pct]       read or set contrast (VCP 12)
+  blank <target>                DDC standby, this monitor only (VCP D6)
+  wake <target>                 bring it back
+  refresh                       drop the detection cache
+
+`target` is a connector name (HDMI-A-1), an i2c bus number, or omitted for
+the focused monitor.
+EOF
+}
+
+main() {
+  need ddcutil
+  need jq
+
+  local command="${1:-list}"
+  shift || true
+
+  case "$command" in
+  list)    cmd_list ;;
+  refresh) invalidate_cache; detect_cached >/dev/null; cmd_list ;;
+  -h | --help | help) usage ;;
+  inputs)
+    local bus
+    bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+    resolve_inputs "$bus"
+    ;;
+  get)
+    local bus
+    bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+    [[ -n ${2:-} ]] || die "get needs a VCP feature code"
+    get_vcp "$bus" "$2" || die "could not read VCP $2"
+    ;;
+  set)
+    local bus
+    bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+    [[ -n ${2:-} && -n ${3:-} ]] || die "set needs a VCP feature code and a value"
+    set_vcp "$bus" "$2" "$3" || die "could not set VCP $2"
+    ;;
+  input)
+    local bus
+    bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+    if [[ -n ${2:-} ]]; then
+      # Input codes are conventionally hex and ddcutil needs the prefix to read
+      # them as such, so normalise whatever spelling the caller used.
+      local code="${2#0x}"
+      code="${code#x}"
+      set_vcp "$bus" "$VCP_INPUT" "0x$code" || die "could not switch input"
+      printf '%s\n' "$code"
+    else
+      # Report the bare hex code, matching `list` -- callers should never have
+      # to strip ddcutil's "x" prefix themselves.
+      local current
+      current="$(get_vcp "$bus" "$VCP_INPUT")" || die "could not read the input source"
+      printf '%s\n' "${current#x}"
+    fi
+    ;;
+  brightness | contrast)
+    local feature bus
+    [[ $command == brightness ]] && feature="$VCP_BRIGHTNESS" || feature="$VCP_CONTRAST"
+    bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+    if [[ -n ${2:-} ]]; then
+      [[ ${2%\%} =~ ^[0-9]+$ ]] || die "$command needs a percentage"
+      set_percent "$bus" "$feature" "${2%\%}" || die "could not set $command"
+    else
+      get_percent "$bus" "$feature" || die "could not read $command"
+    fi
+    ;;
+  blank | wake)
+    local targets=() bus
+    if [[ ${1:-} == "all" ]]; then
+      mapfile -t targets < <(detect_cached | cut -f1)
+    else
+      bus="$(resolve_bus "${1:-}")" || die "no DDC display for '${1:-focused}'"
+      targets=("$bus")
+    fi
+    local failed=0
+    for bus in "${targets[@]}"; do
+      if [[ $command == blank ]]; then
+        blank_bus "$bus" || failed=1
+      else
+        wake_bus "$bus" || failed=1
+      fi
+    done
+    (( failed == 0 )) || die "$command failed on at least one display"
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+  esac
+}
+
+main "$@"
