@@ -78,12 +78,44 @@ Omarchy touched it. So the split is:
 
 ```
 ~/.config/omarchy/plugins/
-├── <user>.monitor/        clone of omarchy.monitor, rebuilt on every install
-│   └── Panel.qml          + a ~14-line Loader block, injected between markers
-└── <user>.ddc/            every line of actual logic lives here
+└── <user>.monitor/        clone of omarchy.monitor, rebuilt on every install
+    ├── Panel.qml          + a small Loader block, injected between markers
     ├── Service.qml        ddcutil state, actions, MPRIS media signal
     └── PanelSection.qml   the UI
 ```
+
+### Why it is one plugin and not two
+
+Until v1 the logic lived in a second plugin, `<user>.ddc`, and `PanelSection.qml`
+reached it with `bar.shell.serviceFor("<user>.ddc")`. Omarchy limits a plugin
+shell to resolving the calling plugin's own service:
+
+```qml
+function pluginOwnsTarget(pluginId, requestedId) {
+  return resolveEnabledId(requestedId) === caller
+}
+```
+
+The section runs under the Display clone, so the lookup returned `null` and the
+DDC block rendered as nothing — no error, no log line. Sharing one plugin id is
+what makes the service reachable, so the service and the section now ship
+inside the clone. `install.sh` retires `<user>.ddc` if it finds one.
+
+`kinds` therefore reads `["bar-widget", "service"]`. Keeping `bar-widget` in it
+matters beyond tidiness: the shell tests clone status by membership, so dropping
+it would cost the clone its standing as a replacement for the built-in panel.
+
+The same sandbox took a second thing with it. The injected Loader used to find
+`PanelSection.qml` through `pluginRegistry.entryPointUrl()`, and a scoped plugin
+shell exposes no `pluginRegistry` at all — so the source resolved to an empty
+string and the Loader rendered nothing, again with no error. Now that the two
+files sit in one directory, the Loader just names the file:
+
+```qml
+source: "PanelSection.qml"
+```
+
+which needs no host API and cannot be withdrawn by one.
 
 `install.sh` re-clones the Display panel **from the current built-in** on every
 run and re-applies the injection. So after `omarchy update`, re-running the
@@ -239,11 +271,15 @@ omarchy-shell ddc input HDMI-A-1 0f
 ## Uninstall
 
 ```sh
-rm -rf ~/.config/omarchy/plugins/$USER.ddc ~/.config/omarchy/plugins/$USER.monitor
+omarchy plugin disable $USER.monitor
+rm -rf ~/.config/omarchy/plugins/$USER.monitor
 rm -f ~/.local/bin/omarchy-ddc
-jq 'del(.plugins[] | select(. == "'"$USER"'.ddc"))' ~/.config/omarchy/shell.json | sponge ~/.config/omarchy/shell.json
 omarchy restart shell
 ```
+
+Disable before deleting: a plugin directory that disappears while the shell
+still has it enabled strands an entry that `omarchy plugin disable` can no
+longer resolve.
 
 Removing the `<user>.monitor` clone restores the built-in Display panel.
 

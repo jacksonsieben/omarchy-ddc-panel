@@ -1,0 +1,11 @@
+{
+  "_comment": "Merged into the cloned Display panel's manifest by install.sh. The service cannot be a plugin of its own: a plugin shell resolves only the calling plugin's service, so PanelSection.qml -- which runs under the clone -- would get null back. PanelSection.qml needs no entry point of its own; Panel.qml loads it by relative path, there being no pluginRegistry to resolve one.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

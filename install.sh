@@ -19,8 +19,14 @@ readonly BIN_DIR="${OMARCHY_DDC_BIN_DIR:-$HOME/.local/bin}"
 # after the user. Overridable so the same repo can be installed under a chosen
 # name rather than whatever the account happens to be called.
 readonly PREFIX="${OMARCHY_DDC_PREFIX:-${USER:-$(id -un)}}"
-readonly PLUGIN_ID="$PREFIX.ddc"
 readonly MONITOR_ID="$PREFIX.monitor"
+# Up to v1 the service was a plugin of its own and PanelSection.qml reached it
+# with `bar.shell.serviceFor()`. Omarchy limits a plugin shell to resolving the
+# calling plugin's own service -- pluginOwnsTarget() in shell.qml -- and the
+# section runs under the Display clone, so it got null back and the DDC block
+# rendered empty with nothing in the log. Service and section now ship inside
+# the clone itself; this id exists only to clean up what v1 installed.
+readonly LEGACY_SERVICE_ID="$PREFIX.ddc"
 readonly MONITOR_SOURCE_ID="omarchy.monitor"
 readonly MONITOR_SOURCE_DIR="$OMARCHY_PATH/shell/plugins/panels/monitor"
 
@@ -56,13 +62,6 @@ esac
 
 # -------------------------------------------------------------------- plugin
 
-say "Installing the $PLUGIN_ID plugin"
-rm -rf "${PLUGINS_DIR:?}/$PLUGIN_ID"
-mkdir -p "$PLUGINS_DIR/$PLUGIN_ID"
-for file in manifest.json Service.qml PanelSection.qml; do
-  sed "s|__PLUGIN_ID__|$PLUGIN_ID|g" "$SOURCE_DIR/plugin/$file" >"$PLUGINS_DIR/$PLUGIN_ID/$file"
-done
-
 # ------------------------------------------------------- Display panel clone
 #
 # Rebuilt from the built-in every run. Anything hand-edited inside the clone is
@@ -84,21 +83,32 @@ touch "$PLUGINS_DIR/$MONITOR_ID/.omarchy-ddc-clone"
 # disables the original, instead of appearing alongside it.
 jq \
   --arg id "$MONITOR_ID" \
-  --arg source "$MONITOR_SOURCE_ID" '
+  --arg source "$MONITOR_SOURCE_ID" \
+  --slurpfile extra "$SOURCE_DIR/plugin/manifest-fragment.json" '
     .id = $id |
     .name = "Display" |
     (if (.barWidget | type) == "object" then .barWidget.displayName = "Display" else . end) |
     .omarchy = ((if (.omarchy | type) == "object" then .omarchy else {} end) + { clonedFrom: $source }) |
-    del(.omarchy.clonePaths)
+    del(.omarchy.clonePaths) |
+    # `*` is a recursive merge, so entryPoints keeps the built-in panel entry
+    # and gains ours. `kinds` is a list and is replaced outright, which is why
+    # the fragment spells out bar-widget alongside service.
+    . * ($extra[0] | del(._comment))
   ' "$PLUGINS_DIR/$MONITOR_ID/manifest.json" >"$PLUGINS_DIR/$MONITOR_ID/manifest.json.tmp"
 mv "$PLUGINS_DIR/$MONITOR_ID/manifest.json.tmp" "$PLUGINS_DIR/$MONITOR_ID/manifest.json"
+
+# After the clone, which wipes the directory first.
+say "Installing the DDC service and panel section into $MONITOR_ID"
+for file in Service.qml PanelSection.qml; do
+  sed "s|__PLUGIN_ID__|$MONITOR_ID|g" "$SOURCE_DIR/plugin/$file" >"$PLUGINS_DIR/$MONITOR_ID/$file"
+done
 
 say "Patching the cloned Panel.qml"
 # Via `env` rather than an assignment prefix: these names are readonly in this
 # shell, and bash rejects a prefix assignment to a readonly variable even when
 # it only ever applies to the child process.
 env \
-  PLUGIN_ID="$PLUGIN_ID" \
+  PLUGIN_ID="$MONITOR_ID" \
   MARKER_BEGIN="$MARKER_BEGIN" \
   MARKER_END="$MARKER_END" \
   python3 - "$PLUGINS_DIR/$MONITOR_ID/Panel.qml" <<'PYTHON'
@@ -151,18 +161,17 @@ block = "\n".join(
     [
         "",
         line(begin),
-        line("// Mounts the DDC controls from the companion plugin. All of the"),
-        line("// logic lives there, so this clone stays small enough to rebuild"),
-        line("// from a newer built-in panel without a merge."),
+        line("// Mounts the DDC controls, which install.sh drops into this same"),
+        line("// plugin directory."),
+        line("//"),
+        line("// A relative source, not a registry lookup: a scoped plugin shell"),
+        line("// exposes no pluginRegistry, so entryPointUrl() resolved to an"),
+        line("// empty string and the Loader rendered nothing, in silence. Same"),
+        line("// file, same directory -- the relative path needs no host API."),
         line("Loader {"),
         line("  width: panelColumn.width"),
         line("  active: true"),
-        line("  source: {"),
-        line("    var registry = root.bar && root.bar.shell ? root.bar.shell.pluginRegistry : null"),
-        line("    if (!registry || !registry.installedPlugins) return \"\""),
-        line('    var manifest = registry.installedPlugins["%s"]' % plugin_id),
-        line("    return manifest ? registry.entryPointUrl(manifest, \"panelSection\") : \"\""),
-        line("  }"),
+        line("  source: \"PanelSection.qml\""),
         line("  onLoaded: if (item) item.panel = root"),
         line("}"),
         line(end),
@@ -177,32 +186,39 @@ PYTHON
 
 # ---------------------------------------------------------------- shell.json
 #
-# A service plugin only loads when its id appears in shell.json. Bar widgets are
-# enabled by being in the layout; services need this explicit entry.
+# v1 added the standalone service to `plugins[]`, because a service-only plugin
+# loads no other way. The service is part of the Display clone now, which is
+# enabled by its slot in the bar layout, so that entry is stale and its plugin
+# directory is gone -- leaving it behind makes the registry log a missing
+# plugin on every start.
 
 if [[ -f $SHELL_CONFIG ]]; then
-  # Entries are objects, not bare strings: the registry reads
-  # `config.plugins[j].id` (PluginRegistry.findEntryLocation), so a plain
-  # "sieben.ddc" is discovered but never counts as enabled -- the service then
-  # silently never mounts, with nothing in the log to say why.
-  if jq -e --arg id "$PLUGIN_ID" '
-       any((.plugins // [])[]; type == "object" and .id == $id)
+  if jq -e --arg id "$LEGACY_SERVICE_ID" '
+       any((.plugins // [])[]; (if type == "object" then .id else . end) == $id)
      ' "$SHELL_CONFIG" >/dev/null; then
-    say "$PLUGIN_ID already enabled in shell.json"
-  else
-    say "Enabling $PLUGIN_ID in shell.json"
+    say "Dropping the retired $LEGACY_SERVICE_ID entry from shell.json"
     tmp="$(mktemp "$SHELL_CONFIG.XXXXXX")"
-    jq --arg id "$PLUGIN_ID" '
-      .plugins = (
-        [ (.plugins // [])[] | select((if type == "object" then .id else . end) != $id) ]
-        + [ { id: $id } ]
-      )
+    jq --arg id "$LEGACY_SERVICE_ID" '
+      .plugins = [ (.plugins // [])[]
+                   | select((if type == "object" then .id else . end) != $id) ]
     ' "$SHELL_CONFIG" >"$tmp"
     chmod --reference="$SHELL_CONFIG" "$tmp"
     mv "$tmp" "$SHELL_CONFIG"
   fi
 else
-  warn "$SHELL_CONFIG does not exist yet; add \"$PLUGIN_ID\" to its plugins[] after first login"
+  warn "$SHELL_CONFIG does not exist yet; the plugin loads after first login"
+fi
+
+# ------------------------------------------------------- retire v1's plugin
+#
+# Disabled before the directory goes: a plugin that disappears while the shell
+# still has it enabled strands an entry that `omarchy plugin disable` can no
+# longer resolve.
+
+if [[ -d $PLUGINS_DIR/$LEGACY_SERVICE_ID ]]; then
+  say "Retiring $LEGACY_SERVICE_ID"
+  omarchy plugin disable "$LEGACY_SERVICE_ID" >/dev/null 2>&1 || true
+  rm -rf "${PLUGINS_DIR:?}/$LEGACY_SERVICE_ID"
 fi
 
 # --------------------------------------------------------------- live shell
