@@ -218,11 +218,21 @@ omarchy-shell ddc input HDMI-A-1 0f
   `activateCursor`). Teaching it about this section means editing all three,
   which defeats the small-injection design. The section is mouse-driven; `j`/`k`
   walks past it.
-- **`ddcutil capabilities` fails on plenty of monitors** even where
-  `getvcp`/`setvcp` work fine — a known firmware quirk, not a bug here. The
-  input list then falls back to the standard MCCS set
-  (VGA/DVI/DisplayPort/HDMI). Vendor-specific codes such as USB-C will not
-  appear; switch to them with `omarchy-ddc input <target> 0x1b`.
+- **Plenty of monitors report a useless input list.** `ddcutil capabilities`
+  either fails outright where `getvcp`/`setvcp` work fine, or — worse — returns
+  a list that is simply wrong: the ASUS XG27AQDMGR advertises `60(01 03)`,
+  VGA-1 and DVI-1, on a panel that has neither while running on HDMI-2. Both
+  are firmware quirks, not bugs here. A capability list that omits the input
+  the monitor is *currently displaying* is treated as untrustworthy, and the
+  input list falls back to the standard MCCS set (VGA/DVI/DisplayPort/HDMI)
+  merged with whatever the monitor did say.
+
+  Those fallback entries are guesses, so the panel dims them and `omarchy-ddc
+  inputs` marks them `assumed`; only the live input is confirmed. Picking a
+  port the monitor does not have leaves it on "no signal" — and with the input
+  switched away it stops answering DDC, so the way back is the monitor's own
+  buttons, not this panel. Vendor-specific codes such as USB-C never appear at
+  all; switch to them with `omarchy-ddc input <target> 0x1b`.
 - **Brightness is not duplicated here.** Omarchy's own slider already writes
   VCP 10, and two sliders writing the same feature would fight.
 

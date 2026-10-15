@@ -247,14 +247,16 @@ set_percent() {
   printf '%s\n' "$percent"
 }
 
-# Resolve the input list for a monitor: its own capability string when it can
-# be read, the standard MCCS list when it cannot.
+# Resolve the input list for a monitor: its own capability string when that
+# string can be believed, the standard MCCS list when it cannot.
+#
+# `current` is the code the monitor is displaying right now. Callers that have
+# already paid for that read pass it in; the rest let this read it.
 resolve_inputs() {
-  local bus="$1" caps
+  local bus="$1" current="${2:-}" caps parsed=""
 
   caps="$(ddc "$bus" capabilities)"
   if [[ -n $caps ]]; then
-    local parsed
     parsed="$(awk '
       /^[[:space:]]*Feature:[[:space:]]*60/ { infeature = 1; next }
       /^[[:space:]]*Feature:/               { infeature = 0 }
@@ -263,13 +265,51 @@ resolve_inputs() {
         printf "%s\t%s\n", tolower(m[1]), m[2]
       }
     ' <<<"$caps")"
-    if [[ -n $parsed ]]; then
-      printf '%s\n' "$parsed"
-      return 0
-    fi
   fi
 
-  standard_inputs
+  if [[ -z $current ]]; then
+    current="$(get_vcp "$bus" "$VCP_INPUT")" || current=""
+  fi
+  current="${current#x}"
+  current="${current,,}"
+
+  # Trust a monitor's own input list only when it accounts for the input the
+  # monitor is displaying right now. A capability string that omits the port
+  # you are currently looking at is provably wrong, and wrong in the worst
+  # direction: the ASUS XG27AQDMGR advertises `60(01 03)` -- VGA-1 and DVI-1 --
+  # on a panel that has neither, while running on HDMI-2. Taking that at face
+  # value hides every real input and offers two whose only effect is to black
+  # the screen out, with no way back except the monitor's own buttons.
+  if [[ -n $parsed ]] && { [[ -z $current ]] || has_input "$current" <<<"$parsed"; }; then
+    awk -F'\t' '{ printf "%s\t%s\tmonitor\n", $1, $2 }' <<<"$parsed"
+    return 0
+  fi
+
+  # Otherwise fall back to the standard MCCS list, keeping whatever the monitor
+  # did say: its labels are better than the generic ones, and a code only it
+  # knows about (USB-C, on the panels that expose one) would be lost by
+  # replacing the list outright. The live input is always in the result, so the
+  # panel can always show which port is actually lit.
+  {
+    [[ -n $parsed ]] && printf '%s\n' "$parsed"
+    standard_inputs
+  } | awk -F'\t' -v cur="$current" '
+    $1 == "" { next }
+    !($1 in label) { label[$1] = $2 }
+    END {
+      if (cur != "" && !(cur in label)) label[cur] = "Input 0x" cur
+      # Everything here is a guess, the monitor\x27s own entries included: the
+      # string they came from has already been shown to be wrong. The one
+      # exception is the input we can see is live.
+      for (code in label)
+        printf "%s\t%s\t%s\n", code, label[code], (code == cur ? "monitor" : "assumed")
+    }
+  ' | sort -t$'\t' -k1,1
+}
+
+# Whether a code<TAB>label list on stdin contains a given code.
+has_input() {
+  awk -F'\t' -v c="$1" '$1 == c { found = 1; exit } END { exit !found }'
 }
 
 # --------------------------------------------------------------------- blank
@@ -379,8 +419,11 @@ cmd_list() {
     connector_blanked "$connector" && blanked=true || blanked=false
     supports_standby "$bus" && standby=true || standby=false
 
-    inputs_json="$(resolve_inputs "$bus" | jq -R -s -c '
-      split("\n") | map(select(length > 0) | split("\t") | {code: .[0], label: .[1]})
+    inputs_json="$(resolve_inputs "$bus" "$input" | jq -R -s -c '
+      split("\n") | map(
+        select(length > 0) | split("\t")
+        | {code: .[0], label: .[1], assumed: (.[2] == "assumed")}
+      )
     ')"
 
     entries+=("$(jq -n -c \
@@ -425,7 +468,7 @@ usage() {
 Usage: omarchy-ddc <command> [target] [value]
 
   list                          JSON for every DDC/CI display
-  inputs <target>               resolved input list (code<TAB>label)
+  inputs <target>               resolved input list (code<TAB>label<TAB>source)
   get <target> <vcp>            read a raw VCP feature
   set <target> <vcp> <value>    write a raw VCP feature
   input <target> [code]         read or switch the input source (VCP 60)

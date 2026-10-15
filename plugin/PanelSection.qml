@@ -57,6 +57,9 @@ Column {
 
       readonly property var display: modelData
       readonly property bool isOled: display && display.oled === true
+      readonly property bool hasAssumedInputs: display && display.inputs
+        ? display.inputs.some(function(i) { return i && i.assumed === true })
+        : false
 
       width: root.width
       spacing: Style.space(10)
@@ -121,7 +124,12 @@ Column {
 
               text: modelData.label
               fontSize: Style.font.caption
-              foreground: root.bar.foreground
+              // Dimmed when the input is a guess rather than something the
+              // monitor confirmed, so the ports that certainly exist read as
+              // the primary choices.
+              foreground: modelData.assumed === true
+                ? Qt.darker(root.bar.foreground, 1.5)
+                : root.bar.foreground
               fontFamily: root.bar.fontFamily
               horizontalPadding: Style.spacing.sm
               verticalPadding: Style.spacing.controlPaddingY
@@ -131,6 +139,22 @@ Column {
               onClicked: root.ddc.setInput(block.display.connector, modelData.code)
             }
           }
+        }
+
+        // Worth saying, because the failure is not recoverable from here.
+        // Switching to a port the monitor does not actually have leaves it on
+        // "no signal", and with the input switched away the monitor stops
+        // answering DDC too -- so the way back is the monitor's own buttons,
+        // not this panel.
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          visible: block.hasAssumedInputs
+          text: "Dimmed inputs are guesses: this monitor's firmware does not report a usable input list, so these are the standard set. Picking one it does not have leaves it on \"no signal\", recoverable only with the monitor's own buttons."
+          color: Qt.darker(root.bar.foreground, 1.5)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
         }
       }
 
